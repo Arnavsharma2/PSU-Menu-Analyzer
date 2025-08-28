@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Fixed Menu Analyzer with proper Penn State form handling
+Final Refactored Menu Analyzer for Penn State with robust,
+individual meal fetching and reliable analysis.
 """
 
 import requests
@@ -11,7 +12,6 @@ from typing import List, Dict, Tuple, Optional
 from datetime import datetime
 import os
 import time
-
 
 class MenuAnalyzer:
     def __init__(self, gemini_api_key: str = None, exclude_beef=False, exclude_pork=False,
@@ -25,9 +25,9 @@ class MenuAnalyzer:
         self.exclude_beef = exclude_beef
         self.exclude_pork = exclude_pork
         self.vegetarian = vegetarian
-        gemini_api_key='AIzaSyC3k6AqP0dgg_LvOdKsNAorKWe9Xqf_bl0'
 
-        # Gemini API setup
+        gemini_api_key = 'AIzaSyC3k6AqP0dgg_LvOdKsNAorKWe9Xqf_bl0'
+        
         self.gemini_api_key = gemini_api_key or os.getenv('GEMINI_API_KEY')
         if self.gemini_api_key:
             self.gemini_url = (
@@ -37,486 +37,269 @@ class MenuAnalyzer:
         elif self.debug:
             print("No Gemini API key provided. Using local analysis only.")
 
-    def fetch_initial_page(self) -> BeautifulSoup:
-        """Fetch the initial menu page to get form data"""
+    def get_initial_form_data(self) -> Optional[Dict[str, Dict[str, str]]]:
         try:
             response = self.session.get(self.base_url, timeout=30)
             response.raise_for_status()
-            return BeautifulSoup(response.content, 'html.parser')
+            soup = BeautifulSoup(response.content, 'html.parser')
+            
+            options = {'campus': {}, 'meal': {}, 'date': {}}
+            for name in options.keys():
+                select_tag = soup.find('select', {'name': f'sel{name.capitalize()}' if name != 'date' else 'selMenuDate'})
+                if select_tag:
+                    for option in select_tag.find_all('option'):
+                        value = option.get('value', '').strip()
+                        text = option.get_text(strip=True)
+                        if value and text:
+                            options[name][text.lower()] = value # Use lowercase keys for easier matching
+            return options
         except requests.RequestException as e:
             if self.debug:
                 print(f"Error fetching initial page: {e}")
             return None
 
-    def get_form_options(self, soup: BeautifulSoup) -> Dict[str, Dict[str, str]]:
-        """Extract all form options for campus, meal, and date selection"""
-        options = {
-            'campus': {},
-            'meal': {},
-            'date': {}
-        }
-        
-        # Find campus options
-        campus_select = soup.find('select', {'name': 'selCampus'})
-        if campus_select:
-            for option in campus_select.find_all('option'):
-                value = option.get('value', '')
-                text = option.get_text(strip=True)
-                if value and text:
-                    options['campus'][text] = value
-                    if self.debug and 'altoona' in text.lower():
-                        print(f"Found Altoona campus option: '{text}' -> '{value}'")
-
-        # Find meal options
-        meal_select = soup.find('select', {'name': 'selMeal'})
-        if meal_select:
-            for option in meal_select.find_all('option'):
-                value = option.get('value', '')
-                text = option.get_text(strip=True)
-                if value and text:
-                    options['meal'][text] = value
-                    if self.debug:
-                        print(f"Found meal option: '{text}' -> '{value}'")
-
-        # Find date options
-        date_select = soup.find('select', {'name': 'selMenuDate'})
-        if date_select:
-            for option in date_select.find_all('option'):
-                value = option.get('value', '')
-                text = option.get_text(strip=True)
-                if value and text:
-                    options['date'][text] = value
-
-        return options
-
-    def get_altoona_campus_value(self, form_options: Dict[str, Dict[str, str]]) -> Optional[str]:
-        """Find the correct value for Altoona campus"""
-        campus_options = form_options.get('campus', {})
-        
-        # Look for Altoona in various formats
-        altoona_patterns = ['altoona', 'port sky', 'port sky cafe']
-        
-        for campus_name, campus_value in campus_options.items():
-            campus_lower = campus_name.lower()
-            if any(pattern in campus_lower for pattern in altoona_patterns):
-                if self.debug:
-                    print(f"Selected Altoona campus: '{campus_name}' (value: {campus_value})")
-                return campus_value
-        
-        if self.debug:
-            print("Available campus options:")
-            for name, value in campus_options.items():
-                print(f"  - '{name}' -> '{value}'")
-            print("Could not find Altoona campus option!")
-        
-        return None
-
-    def fetch_specific_meal(self, campus_value: str, meal_value: str, date_value: str = "") -> List[str]:
-        """Fetch menu for specific campus, meal, and date"""
-        try:
-            form_data = {
-                'selCampus': campus_value,
-                'selMeal': meal_value,
-                'selMenuDate': date_value  # Empty string for today's date
-            }
-            
-            if self.debug:
-                print(f"Submitting form data: {form_data}")
-            
-            response = self.session.post(self.base_url, data=form_data, timeout=30)
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.content, 'html.parser')
-            
-            # Save debug HTML for this specific meal
-            if self.debug:
-                meal_name = meal_value.replace(' ', '_').lower()
-                filename = f"debug_{meal_name}_altoona.html"
-                with open(filename, 'w', encoding='utf-8') as f:
-                    f.write(soup.prettify())
-                print(f"Saved {meal_name} HTML to {filename}")
-            
-            return self.extract_food_items_from_response(soup)
-            
-        except Exception as e:
-            if self.debug:
-                print(f"Error fetching meal {meal_value}: {e}")
-            return []
-
-    def extract_food_items_from_response(self, soup: BeautifulSoup) -> List[str]:
-        """Extract food items from the menu response page"""
-        food_items = []
-        
-        # Method 1: Look for menu item containers
-        menu_containers = soup.find_all(['div', 'td', 'span'], 
-                                       class_=re.compile(r'menu|item|food', re.IGNORECASE))
-        
-        for container in menu_containers:
-            text = container.get_text(strip=True)
-            if self.looks_like_food_item(text):
-                food_items.append(text)
-        
-        # Method 2: Look for specific patterns in table cells
-        table_cells = soup.find_all('td')
-        for cell in table_cells:
-            text = cell.get_text(strip=True)
-            if self.looks_like_food_item(text):
-                food_items.append(text)
-        
-        # Method 3: Look for list items
-        list_items = soup.find_all('li')
-        for item in list_items:
-            text = item.get_text(strip=True)
-            if self.looks_like_food_item(text):
-                food_items.append(text)
-        
-        # Method 4: Look for any text that might be food items
-        all_text_elements = soup.find_all(['span', 'div', 'p', 'strong', 'b'])
-        for element in all_text_elements:
-            text = element.get_text(strip=True)
-            if self.looks_like_food_item(text) and len(text.split()) <= 6:
-                food_items.append(text)
-        
-        # Clean up and deduplicate
-        food_items = [item for item in food_items if len(item.strip()) > 2]
-        food_items = list(set(food_items))  # Remove duplicates
-        
-        # Filter out obvious non-food items
-        food_items = [item for item in food_items if not self.is_navigation_or_ui_text(item)]
-        
-        if self.debug:
-            print(f"Extracted {len(food_items)} food items:")
-            for item in food_items[:10]:  # Show first 10
-                print(f"  - {item}")
-            if len(food_items) > 10:
-                print(f"  ... and {len(food_items) - 10} more")
-        
-        return food_items
-
     def looks_like_food_item(self, text: str) -> bool:
-        """Enhanced food item detection"""
-        if not text or len(text.strip()) < 3:
+        if not text or len(text.strip()) < 3 or len(text.strip()) > 70:
             return False
-            
-        text = text.strip()
+        
         text_lower = text.lower()
-        
-        # Skip if too long (likely descriptions)
-        if len(text) > 100:
-            return False
-        
-        # Skip obvious UI/navigation text
-        ui_terms = ['click', 'select', 'menu', 'page', 'home', 'login', 'search',
-                   'view', 'print', 'back', 'next', 'submit', 'cancel', 'choose',
-                   'options', 'settings', 'help', 'contact', 'about']
-        if any(term in text_lower for term in ui_terms):
-            return False
-        
-        # Skip if mostly numbers or special characters
-        alpha_ratio = sum(c.isalpha() for c in text) / len(text)
-        if alpha_ratio < 0.5:
-            return False
-        
-        # Strong food indicators
-        strong_food_words = [
-            'chicken', 'beef', 'pork', 'fish', 'turkey', 'salmon', 'tuna',
-            'burger', 'pizza', 'pasta', 'salad', 'sandwich', 'soup', 'steak',
-            'rice', 'beans', 'vegetables', 'fruit', 'cheese', 'bread',
-            'grilled', 'baked', 'fried', 'roasted', 'steamed', 'sautéed'
+        non_food_keywords = [
+            'select', 'menu', 'date', 'campus', 'print', 'view', 'nutrition', 'allergen',
+            'feedback', 'contact', 'hours', 'location', 'penn state', 'altoona', 
+            'port sky', 'cafe', 'kitchen', 'station', 'grill', 'deli', 'market',
+            'made to order', 'action'
         ]
+        if any(keyword in text_lower for keyword in non_food_keywords):
+            return False
         
-        if any(word in text_lower for word in strong_food_words):
-            return True
-        
-        # Moderate food indicators
-        moderate_food_words = [
-            'bowl', 'plate', 'wrap', 'roll', 'cake', 'cookie', 'pie',
-            'sauce', 'dressing', 'seasoned', 'spiced', 'fresh', 'hot'
-        ]
-        
-        moderate_matches = sum(1 for word in moderate_food_words if word in text_lower)
-        
-        # If it has moderate indicators and looks like a reasonable food name
-        if moderate_matches > 0 and 2 <= len(text.split()) <= 8:
-            return True
-        
-        # If it's a short phrase without obvious non-food indicators
-        if 2 <= len(text.split()) <= 6 and not any(char in text for char in ['@', 'http', '.com', '()', '[]']):
-            # Check if it contains at least one word that could be food-related
-            words = text_lower.split()
-            food_like_words = [
-                'bowl', 'cup', 'plate', 'special', 'daily', 'fresh', 'hot', 'cold',
-                'classic', 'traditional', 'homemade', 'style', 'with', 'and'
-            ]
-            if any(word in food_like_words for word in words):
-                return True
-        
-        return False
+        if not any(c.isalpha() for c in text):
+            return False
 
-    def is_navigation_or_ui_text(self, text: str) -> bool:
-        """Check if text is likely navigation or UI text"""
-        text_lower = text.lower().strip()
-        
-        nav_phrases = [
-            'view menu', 'select date', 'choose location', 'dining options',
-            'meal plans', 'nutrition info', 'allergen info', 'hours',
-            'locations', 'contact us', 'feedback', 'terms', 'privacy'
-        ]
-        
-        return any(phrase in text_lower for phrase in nav_phrases)
+        return True
 
+    def extract_items_from_meal_page(self, soup: BeautifulSoup) -> List[str]:
+        """Extracts all food items from a page dedicated to a single meal."""
+        items = set()
+        # Search a wide variety of tags where food items might be listed
+        for element in soup.find_all(['td', 'li', 'a', 'b', 'strong', 'span']):
+            text = element.get_text(strip=True)
+            if self.looks_like_food_item(text):
+                items.add(text)
+        return sorted(list(items))
+
+    # NEW: This is the robust main workflow
     def run_analysis(self) -> Dict[str, List[Tuple[str, int, str]]]:
-        """Main analysis with proper form handling"""
         if self.debug:
-            print("Fetching initial page to get form options...")
+            print("Fetching initial form options...")
         
-        soup = self.fetch_initial_page()
-        if not soup:
-            if self.debug:
-                print("Could not fetch initial page, using fallback data")
+        form_options = self.get_initial_form_data()
+        if not form_options:
+            print("Could not fetch form data. Using fallback.")
             return self.get_fallback_data()
-        
-        # Get form options
-        form_options = self.get_form_options(soup)
-        
+
         # Find Altoona campus value
-        altoona_value = self.get_altoona_campus_value(form_options)
+        campus_options = form_options.get('campus', {})
+        altoona_value = next((val for name, val in campus_options.items() if 'altoona' in name), None)
         if not altoona_value:
-            if self.debug:
-                print("Could not find Altoona campus, using fallback data")
+            print("Could not find Altoona campus value. Using fallback.")
             return self.get_fallback_data()
-        
-        # Get meal options
-        meal_options = form_options.get('meal', {})
-        if not meal_options:
-            if self.debug:
-                print("No meal options found, using fallback data")
-            return self.get_fallback_data()
-        
-        # Fetch each meal separately
-        results = {}
-        meal_mapping = {
-            'Breakfast': ['breakfast', 'morning'],
-            'Lunch': ['lunch', 'midday'],
-            'Dinner': ['dinner', 'evening', 'supper']
-        }
-        
-        for target_meal in ['Breakfast', 'Lunch', 'Dinner']:
-            meal_value = None
-            
-            # Find the correct meal value
-            for meal_name, meal_val in meal_options.items():
-                meal_name_lower = meal_name.lower()
-                if any(keyword in meal_name_lower for keyword in meal_mapping[target_meal]):
-                    meal_value = meal_val
-                    break
-            
-            if meal_value:
-                if self.debug:
-                    print(f"Fetching {target_meal} menu...")
-                
-                food_items = self.fetch_specific_meal(altoona_value, meal_value)
-                
-                if food_items:
-                    if self.debug:
-                        print(f"Found {len(food_items)} items for {target_meal}")
-                    
-                    analyzed_items = self.analyze_food_with_gemini(food_items)
-                    analyzed_items.sort(key=lambda x: x[1], reverse=True)
-                    results[target_meal] = analyzed_items
-                else:
-                    if self.debug:
-                        print(f"No food items found for {target_meal}")
+
+        # Find today's date value
+        date_options = form_options.get('date', {})
+        today_str_key = datetime.now().strftime('%A, %B %d').lower()
+        date_value = date_options.get(today_str_key)
+        if not date_value:
+            if date_options:
+                first_available_date = list(date_options.keys())[0]
+                date_value = list(date_options.values())[0]
+                print(f"Warning: Today's menu ('{today_str_key}') not found. Using first available date: {first_available_date}")
             else:
+                print("No dates found. Using fallback.")
+                return self.get_fallback_data()
+
+        # --- Main Scraping Loop ---
+        daily_menu = {}
+        meal_options = form_options.get('meal', {})
+        
+        for meal_name in ["Breakfast", "Lunch", "Dinner"]:
+            meal_key = meal_name.lower()
+            meal_value = meal_options.get(meal_key)
+            
+            if not meal_value:
                 if self.debug:
-                    print(f"Could not find meal option for {target_meal}")
+                    print(f"Could not find form value for '{meal_name}'. Skipping.")
+                continue
+
+            try:
+                form_data = {'selCampus': altoona_value, 'selMeal': meal_value, 'selMenuDate': date_value}
+                if self.debug:
+                    print(f"Fetching menu for {meal_name} with data: {form_data}")
+                
+                response = self.session.post(self.base_url, data=form_data, timeout=30)
+                response.raise_for_status()
+                meal_soup = BeautifulSoup(response.content, 'html.parser')
+                
+                items = self.extract_items_from_meal_page(meal_soup)
+                if items:
+                    daily_menu[meal_name] = items
+                    if self.debug:
+                        print(f"Found {len(items)} items for {meal_name}.")
+                
+                time.sleep(0.5) # Be polite to the server
+
+            except requests.RequestException as e:
+                if self.debug:
+                    print(f"Error fetching {meal_name} menu: {e}")
+
+        if not daily_menu:
+            print("Failed to scrape any menu items from the website. Using fallback data.")
+            return self.get_fallback_data()
+
+        # --- Analysis and Filtering ---
+        analyzed_results = self.analyze_menu_with_gemini(daily_menu) if self.gemini_api_key else self.analyze_menu_local(daily_menu)
         
-        return results if results else self.get_fallback_data()
-
-    def get_fallback_data(self) -> Dict[str, List[Tuple[str, int, str]]]:
-        """Fallback data if website scraping fails"""
-        fallback_meals = {
-            "Breakfast": ["Scrambled Eggs", "Turkey Sausage", "Oatmeal", "Fresh Fruit", "Yogurt"],
-            "Lunch": ["Grilled Chicken Salad", "Turkey Club Sandwich", "Vegetable Soup", "Quinoa Bowl"],
-            "Dinner": ["Baked Salmon", "Beef Stir-Fry", "Grilled Chicken Breast", "Pasta Primavera"]
-        }
+        final_results = {}
+        for meal, items in analyzed_results.items():
+            final_results[meal] = self.apply_hard_filters(items)
         
-        results = {}
-        for meal_name, food_items in fallback_meals.items():
-            analyzed_items = self.analyze_food_health_local(food_items)
-            analyzed_items.sort(key=lambda x: x[1], reverse=True)
-            results[meal_name] = analyzed_items
-        
-        return results
+        return final_results
+    
+    # ... (The rest of the analysis, filtering, and printing methods remain the same) ...
 
-    # Include your existing analysis methods here...
-    def analyze_food_with_gemini(self, food_items: List[str]) -> List[Tuple[str, int, str]]:
-        if not self.gemini_api_key:
-            return self.analyze_food_health_local(food_items)
-
-        try:
-            batch_size = 10
-            all_results = []
-            for i in range(0, len(food_items), batch_size):
-                batch = food_items[i:i + batch_size]
-                batch_results = self._analyze_batch_with_gemini(batch)
-                all_results.extend(batch_results)
-                time.sleep(1)
-            return all_results
-        except Exception as e:
-            if self.debug:
-                print(f"Gemini analysis failed: {e}")
-            return self.analyze_food_health_local(food_items)
-
-    def _analyze_batch_with_gemini(self, food_batch: List[str]) -> List[Tuple[str, int, str]]:
-        food_list = "\n".join([f"- {item}" for item in food_batch])
-
+    def analyze_menu_with_gemini(self, daily_menu: Dict[str, List[str]]) -> Dict[str, List[Tuple[str, int, str]]]:
         exclusions = []
-        if self.exclude_beef:
-            exclusions.append("Do not recommend beef items.")
-        if self.exclude_pork:
-            exclusions.append("Do not recommend pork items.")
-        if self.vegetarian:
-            exclusions.append("Only recommend vegetarian options.")
-        restrictions_text = "\n".join(exclusions) if exclusions else "No dietary restrictions."
+        if self.exclude_beef: exclusions.append("No beef.")
+        if self.exclude_pork: exclusions.append("No pork.")
+        if self.vegetarian: exclusions.append("Only vegetarian items.")
+        restrictions_text = " ".join(exclusions) if exclusions else "None."
 
         prompt = f"""
-        Analyze these dining hall foods for PROTEIN content and healthiness.
-        {restrictions_text}
+        Analyze the following Penn State dining hall menu for health and protein content. My dietary restrictions are: {restrictions_text}
 
-        Foods: {food_list}
+        For EACH meal period (Breakfast, Lunch, Dinner), identify the top 5 healthiest, highest-protein options that adhere to my restrictions.
 
-        Respond in JSON format:
-        {{
-            "food_name": {{"score": 90, "reasoning": "High protein, healthy prep"}}
-        }}
+        Return your response as a single, valid JSON object. The top-level keys must be "Breakfast", "Lunch", and "Dinner". The value for each key should be a list of objects, where each object contains three keys: "food_name" (string), "score" (an integer from 0 to 100), and "reasoning" (a brief string explanation).
+
+        Menu:
+        {json.dumps(daily_menu, indent=2)}
         """
-
+        
         try:
             response = self.session.post(
                 self.gemini_url,
                 headers={"Content-Type": "application/json"},
                 json={"contents": [{"parts": [{"text": prompt}]}]},
-                timeout=30
+                timeout=60
             )
             response.raise_for_status()
             data = response.json()
             text_response = data["candidates"][0]["content"]["parts"][0]["text"]
 
-            # Clean and parse response
-            text_response = re.sub(r"```(json)?", "", text_response, flags=re.IGNORECASE).strip()
-            text_response = re.sub(r"```$", "", text_response).strip()
+            json_str = re.search(r'\{.*\}', text_response, re.DOTALL).group(0)
+            parsed_json = json.loads(json_str)
 
-            parsed = json.loads(text_response)
-            return [(food, int(info.get("score", 0)), info.get("reasoning", "")) 
-                   for food, info in parsed.items()]
+            results = {}
+            for meal, items in parsed_json.items():
+                results[meal] = [(item.get('food_name'), item.get('score'), item.get('reasoning')) for item in items]
+                results[meal].sort(key=lambda x: x[1], reverse=True)
+            return results
+
         except Exception as e:
             if self.debug:
-                print(f"Failed to parse Gemini response: {e}")
-            return self.analyze_food_health_local(food_batch)
+                print(f"Gemini analysis failed: {e}. Falling back to local analysis.")
+            return self.analyze_menu_local(daily_menu)
 
-    def analyze_food_health_local(self, food_items: List[str]) -> List[Tuple[str, int, str]]:
-        """Enhanced local analysis with dietary restrictions"""
+    def apply_hard_filters(self, food_items: List[Tuple[str, int, str]]) -> List[Tuple[str, int, str]]:
+        if not (self.exclude_beef or self.exclude_pork or self.vegetarian):
+            return food_items
+
+        filtered_list = []
+        for food, score, reason in food_items:
+            item_lower = food.lower()
+            excluded = False
+            if self.exclude_beef and "beef" in item_lower:
+                excluded = True
+            if self.exclude_pork and any(p in item_lower for p in ["pork", "bacon", "sausage", "ham"]):
+                excluded = True
+            if self.vegetarian and any(m in item_lower for m in ["beef", "pork", "chicken", "turkey", "fish", "salmon", "tuna", "bacon", "sausage", "ham"]):
+                excluded = True
+            
+            if not excluded:
+                filtered_list.append((food, score, reason))
+        return filtered_list
+
+    def get_fallback_data(self) -> Dict[str, List[Tuple[str, int, str]]]:
+        fallback_menu = {
+            "Breakfast": ["Scrambled Eggs", "Turkey Sausage", "Oatmeal", "Fresh Fruit"],
+            "Lunch": ["Grilled Chicken Salad", "Turkey Club Sandwich", "Vegetable Soup", "Quinoa Bowl"],
+            "Dinner": ["Baked Salmon", "Beef Stir-Fry", "Grilled Chicken Breast", "Pasta Primavera"]
+        }
+        analyzed = self.analyze_menu_local(fallback_menu)
+        filtered_fallback = {}
+        for meal, items in analyzed.items():
+            filtered_fallback[meal] = self.apply_hard_filters(items)
+        return filtered_fallback
+
+    def analyze_menu_local(self, daily_menu: Dict[str, List[str]]) -> Dict[str, List[Tuple[str, int, str]]]:
+        results = {}
+        for meal, items in daily_menu.items():
+            analyzed_items = self.analyze_food_health_local_list(items)
+            analyzed_items.sort(key=lambda x: x[1], reverse=True)
+            results[meal] = analyzed_items
+        return results
+
+    def analyze_food_health_local_list(self, food_items: List[str]) -> List[Tuple[str, int, str]]:
         health_scores = []
-
-        protein_keywords = {
-            'excellent': ['grilled chicken', 'baked fish', 'turkey breast', 'salmon', 'tuna'],
-            'good': ['chicken', 'fish', 'turkey', 'beef', 'eggs', 'tofu', 'beans'],
-            'moderate': ['cheese', 'nuts', 'yogurt', 'milk']
-        }
-
-        healthy_prep = {
-            'excellent': ['grilled', 'baked', 'steamed', 'roasted', 'fresh'],
-            'good': ['sautéed', 'stir-fry', 'broiled'],
-            'poor': ['fried', 'deep-fried', 'battered', 'creamy']
-        }
-
+        protein_keywords = {'excellent': ['chicken', 'salmon', 'tuna', 'turkey'], 'good': ['beef', 'eggs', 'tofu', 'beans'], 'moderate': ['cheese', 'yogurt']}
+        healthy_prep = {'excellent': ['grilled', 'baked', 'steamed'], 'good': ['sautéed'], 'poor': ['fried', 'creamy', 'battered']}
         for item in food_items:
             item_lower = item.lower()
             score = 50
-            reasoning_parts = []
-
-            # Apply dietary restrictions
-            if self.exclude_beef and "beef" in item_lower:
-                score = 0
-                reasoning_parts.append("Excluded: contains beef")
-            elif self.exclude_pork and "pork" in item_lower:
-                score = 0
-                reasoning_parts.append("Excluded: contains pork")
-            elif self.vegetarian and any(meat in item_lower for meat in ["beef", "pork", "chicken", "fish", "turkey"]):
-                score = 0
-                reasoning_parts.append("Excluded: contains meat")
-            else:
-                # Protein scoring
-                for level, keywords in protein_keywords.items():
-                    matches = [kw for kw in keywords if kw in item_lower]
-                    if matches:
-                        if level == 'excellent':
-                            score += 25
-                            reasoning_parts.append(f"Excellent protein ({matches[0]})")
-                        elif level == 'good':
-                            score += 15
-                            reasoning_parts.append(f"Good protein ({matches[0]})")
-                        else:
-                            score += 8
-                        break
-
-                # Preparation scoring
-                for level, keywords in healthy_prep.items():
-                    matches = [kw for kw in keywords if kw in item_lower]
-                    if matches:
-                        if level == 'excellent':
-                            score += 15
-                            reasoning_parts.append(f"Healthy prep ({matches[0]})")
-                        elif level == 'good':
-                            score += 8
-                        elif level == 'poor':
-                            score -= 20
-                            reasoning_parts.append(f"Unhealthy prep ({matches[0]})")
-                        break
-
+            reasoning = []
+            for level, keywords in protein_keywords.items():
+                if any(kw in item_lower for kw in keywords):
+                    score += {'excellent': 30, 'good': 20, 'moderate': 10}[level]
+                    reasoning.append(f"High protein ({level})")
+                    break
+            for level, keywords in healthy_prep.items():
+                if any(kw in item_lower for kw in keywords):
+                    score += {'excellent': 20, 'good': 10, 'poor': -25}[level]
+                    reasoning.append(f"Prep style ({level})")
+                    break
             score = max(0, min(100, score))
-            reasoning = "; ".join(reasoning_parts) if reasoning_parts else "Standard option"
-            health_scores.append((item, score, reasoning))
-
+            health_scores.append((item, score, ", ".join(reasoning) or "Standard option"))
         return health_scores
 
     def print_detailed_recommendations(self, results: Dict[str, List[Tuple[str, int, str]]], top_n: int = 5):
         print("\n" + "="*90)
-        print("HEALTHY HIGH-PROTEIN FOOD RECOMMENDATIONS - PENN STATE ALTOONA")
+        print("      PENN STATE ALTOONA - HEALTHY & HIGH-PROTEIN DINING RECOMMENDATIONS")
+        print(f"      Generated on: {datetime.now().strftime('%A, %B %d, %Y')}")
         print("="*90)
 
-        all_items = []
-        for meal_name, items in results.items():
+        if not any(results.values()):
+            print("\nSorry, no menu items could be found or recommended for today based on your preferences.")
+            return
+
+        for meal_name in ["Breakfast", "Lunch", "Dinner"]:
+            items = results.get(meal_name)
             if items:
-                print(f"\n{meal_name.upper()}:")
-                print("-" * 60)
-                for i, (food_item, score, reasoning) in enumerate(items[:top_n]):
-                    print(f"{i+1}. {food_item}")
-                    print(f"   Score: {score}/100")
-                    print(f"   Analysis: {reasoning}")
-                    print()
-                    all_items.append((food_item, score, reasoning))
-
-        if all_items:
-            print("\n" + "="*90)
-            top_items = sorted(all_items, key=lambda x: x[1], reverse=True)[:top_n]
-            print("TOP RECOMMENDATIONS ACROSS ALL MEALS:")
-            print("-" * 60)
-            for i, (food, score, reasoning) in enumerate(top_items, 1):
-                print(f"{i}. {food} (Score: {score}/100)")
-                print(f"   {reasoning}")
-                print()
-
+                print(f"\n--- {meal_name.upper()} ---")
+                for i, (food, score, reason) in enumerate(items[:top_n], 1):
+                    print(f"  {i}. {food:<40} | Score: {score}/100")
+                    print(f"     └─ Analysis: {reason}")
+            else:
+                print(f"\n--- {meal_name.upper()} ---")
+                print("  No items found or recommended for this meal.")
+        print("\n" + "="*90)
 
 if __name__ == "__main__":
     analyzer = MenuAnalyzer(
-        gemini_api_key=os.getenv('GEMINI_API_KEY'),  # Set your API key
+        gemini_api_key=os.getenv('GEMINI_API_KEY'),
         exclude_beef=False,
         exclude_pork=False,
         vegetarian=False,
         debug=True
     )
     
-    results = analyzer.run_analysis()
-    analyzer.print_detailed_recommendations(results)
+    final_recommendations = analyzer.run_analysis()
+    analyzer.print_detailed_recommendations(final_recommendations)
